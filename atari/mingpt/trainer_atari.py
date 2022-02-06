@@ -32,9 +32,11 @@ from collections import deque
 import random
 import cv2
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 
 class TrainerConfig:
+    # optimization parameters
     # optimization parameters
     max_epochs = 10
     batch_size = 64
@@ -56,7 +58,7 @@ class TrainerConfig:
 
 class Trainer:
 
-    def __init__(self, model, train_dataset, test_dataset, config):
+    def __init__(self, model, train_dataset, test_dataset, config, comment, exp_reward):
         self.model = model
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
@@ -67,6 +69,10 @@ class Trainer:
         if torch.cuda.is_available():
             self.device = torch.cuda.current_device()
             self.model = torch.nn.DataParallel(self.model).to(self.device)
+
+        self.output = open('output.txt', 'a')
+        self.writer = SummaryWriter(comment=comment)
+        self.exp_reward = exp_reward
 
     def save_checkpoint(self):
         # DataParallel wrappers keep raw model object in .module attribute
@@ -79,7 +85,7 @@ class Trainer:
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
 
-        def run_epoch(split, epoch_num=0):
+        def run_epoch(writer, split, epoch_num=0):
             is_train = split == 'train'
             model.train(is_train)
             data = self.train_dataset if is_train else self.test_dataset
@@ -130,6 +136,7 @@ class Trainer:
 
                     # report progress
                     pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                    writer.add_scalar("loss", loss.item(), it + epoch*500000)
 
             if not is_train:
                 test_loss = float(np.mean(losses))
@@ -144,7 +151,7 @@ class Trainer:
 
         for epoch in range(config.max_epochs):
 
-            run_epoch('train', epoch_num=epoch)
+            run_epoch(self.writer, 'train', epoch_num=epoch)
             # if self.test_dataset is not None:
             #     test_loss = run_epoch('test')
 
@@ -156,22 +163,22 @@ class Trainer:
 
             # -- pass in target returns
             if self.config.model_type == 'naive':
-                eval_return = self.get_returns(0)
+                eval_return = self.get_returns(0, epoch)
             elif self.config.model_type == 'reward_conditioned':
                 if self.config.game == 'Breakout':
-                    eval_return = self.get_returns(90)
+                    eval_return = self.get_returns(self.exp_reward, epoch)
                 elif self.config.game == 'Seaquest':
-                    eval_return = self.get_returns(1150)
+                    eval_return = self.get_returns(1150, epoch)
                 elif self.config.game == 'Qbert':
-                    eval_return = self.get_returns(14000)
+                    eval_return = self.get_returns(14000, epoch)
                 elif self.config.game == 'Pong':
-                    eval_return = self.get_returns(20)
+                    eval_return = self.get_returns(20, epoch)
                 else:
                     raise NotImplementedError()
             else:
                 raise NotImplementedError()
 
-    def get_returns(self, ret):
+    def get_returns(self, ret, epoch):
         self.model.train(False)
         args=Args(self.config.game.lower(), self.config.seed)
         env = Env(args)
@@ -179,7 +186,8 @@ class Trainer:
 
         T_rewards, T_Qs = [], []
         done = True
-        for i in range(10):
+        Episodes = 10
+        for i in range(Episodes):
             state = env.reset()
             state = state.type(torch.float32).to(self.device).unsqueeze(0).unsqueeze(0)
             rtgs = [ret]
@@ -217,7 +225,13 @@ class Trainer:
                     timesteps=(min(j, self.config.max_timestep) * torch.ones((1, 1, 1), dtype=torch.int64).to(self.device)))
         env.close()
         eval_return = sum(T_rewards)/10.
-        print("target return: %d, eval return: %d" % (ret, eval_return))
+
+        print("target retturn: %d, eval return: %d" % (ret, eval_return))
+        for i in range(0, Episodes):
+            self.writer.add_scalar("test_env_res", T_rewards[i], i + epoch*10)
+
+        self.writer.add_scalar('mean_score_per_epoch', eval_return, epoch)
+
         self.model.train(True)
         return eval_return
 
@@ -272,7 +286,11 @@ class Env():
         frame_buffer = torch.zeros(2, 84, 84, device=self.device)
         reward, done = 0, False
         for t in range(4):
-            reward += self.ale.act(self.actions.get(action))
+            act = self.actions.get(action)
+            if isinstance(act, type(None)):
+                continue
+            
+            reward += self.ale.act(act)
             if t == 2:
                 frame_buffer[0] = self._get_state()
             elif t == 3:
