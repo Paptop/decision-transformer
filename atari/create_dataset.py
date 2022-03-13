@@ -32,7 +32,7 @@ def create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_p
     while len(obss) < num_steps:
         buffer_num = np.random.choice(np.arange(50 - num_buffers, 50), 1)[0]
         i = transitions_per_buffer[buffer_num]
-        print('loading from buffer %d which has %d already loaded' % (buffer_num, i))
+        #print('loading from buffer %d which has %d already loaded' % (buffer_num, i))
         frb = FixedReplayBuffer(
             data_dir=data_dir_prefix + game + '/1/replay_logs',
             replay_suffix=buffer_num,

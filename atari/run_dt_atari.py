@@ -10,6 +10,7 @@ import math
 from torch.utils.data import Dataset
 from mingpt.model_atari import GPT, GPTConfig
 from mingpt.trainer_atari import Trainer, TrainerConfig
+from mingpt.env_target_map import EnvTargetMap
 from mingpt.utils import sample
 from collections import deque
 import random
@@ -18,6 +19,7 @@ import pickle
 import blosc
 import argparse
 from create_dataset import create_dataset
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=123)
@@ -30,7 +32,7 @@ parser.add_argument('--game', type=str, default='Breakout')
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--layers', type=int, default=6)
 parser.add_argument('--att_heads', type=int, default=8)
-parser.add_argument('--comment', type=str, default='')
+parser.add_argument('--comment', type=str, default='anonymous')
 parser.add_argument('--expected_reward', type=int, default=90) #For now breakout
 # 
 parser.add_argument('--trajectories_per_buffer', type=int, default=10, help='Number of trajectories to sample from each of the buffers.')
@@ -41,7 +43,7 @@ set_seed(args.seed)
 
 class StateActionReturnDataset(Dataset):
 
-    def __init__(self, data, block_size, actions, done_idxs, rtgs, timesteps):        
+    def __init__(self, data, block_size, actions, done_idxs, rtgs, timesteps):
         self.block_size = block_size
         self.vocab_size = max(actions) + 1
         self.data = data
@@ -69,38 +71,35 @@ class StateActionReturnDataset(Dataset):
 
         return states, actions, rtgs, timesteps
 
-obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(45, 500000, args.game, args.data_dir_prefix, args.trajectories_per_buffer)
-#obss_p, actions_p, returns_p, done_idxs_p, rtgs_p, timesteps_p = create_dataset(5, 50000, "Pong", args.data_dir_prefix, args.trajectories_per_buffer)
+def main():
+    if not EnvTargetMap.IsReady(args.game):
+        print(f"Environment with name \'{args.game}\' is not supported for now")
+        return
 
-# set up logging
-logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-)
+    obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(args.num_buffers, args.num_steps, args.game, args.data_dir_prefix, args.trajectories_per_buffer)
 
-#train_dataset_p = StateActionReturnDataset(obss_p, args.context_length*3, actions_p, done_idxs_p, rtgs_p, timesteps_p)
-train_dataset = StateActionReturnDataset(obss, args.context_length*3, actions, done_idxs, rtgs, timesteps)
+    # set up logging
+    logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+    )
 
-#print(train_dataset_p.vocab_size, " ", train_dataset_p.block_size)
-print(train_dataset.vocab_size, " ", train_dataset.block_size)
+    train_dataset = StateActionReturnDataset(obss, args.context_length*3, actions, done_idxs, rtgs, timesteps)
 
-mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
-                  n_layer=args.layers, n_head=args.att_heads, n_embd=128, model_type=args.model_type, max_timestep=max(timesteps))
-model = GPT(mconf)
+    print(f"Env %s, Vocab size %s, block size %s max timesteps %s" % (args.game, train_dataset.vocab_size, train_dataset.block_size, max(timesteps) ))
+    mconf = GPTConfig(18, train_dataset.block_size,
+                      n_layer=args.layers, n_head=args.att_heads, n_embd=128, model_type=args.model_type, max_timestep=30000)
+    model = GPT(mconf)
 
-# initialize a trainer instance and kick off training
-epochs = args.epochs
-tconf = TrainerConfig(max_epochs=epochs, batch_size=args.batch_size, learning_rate=3e-4,
-                      lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*args.context_length*3,
-                      num_workers=4, seed=args.seed, model_type=args.model_type, game=args.game, max_timestep=max(timesteps))
+    # initialize a trainer instance and kick off training
+    epochs = args.epochs
+    tconf = TrainerConfig(max_epochs=epochs, batch_size=args.batch_size, learning_rate=3e-4,
+                          lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*args.context_length*3,
+                          num_workers=4, seed=args.seed, model_type=args.model_type, game=args.game, max_timestep=30000)
 
-#tconf_p = TrainerConfig(max_epochs=2, batch_size=args.batch_size, learning_rate=3e-4,
-#                      lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset_p)*args.context_length*3,
-#                      num_workers=4, seed=args.seed, model_type=args.model_type, game="Pong", max_timestep=max(timesteps))
+    trainer = Trainer(model, train_dataset, None, tconf, args.comment, args.expected_reward)
+    trainer.train()
 
-#trainer = Trainer(model, train_dataset_p, None, tconf_p)
-#trainer.train()
-trainer = Trainer(model, train_dataset, None, tconf, args.comment, args.expected_reward)
-trainer.train()
-
+if __name__ == "__main__":
+    main()

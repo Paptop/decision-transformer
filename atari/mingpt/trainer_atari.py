@@ -25,13 +25,18 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
 
 logger = logging.getLogger(__name__)
-
 from mingpt.utils import sample
+from mingpt.env_target_map import EnvTargetMap
+
 import atari_py
 from collections import deque
 import random
 import cv2
 import torch
+import csv
+import re
+import os
+from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 
@@ -49,12 +54,15 @@ class TrainerConfig:
     warmup_tokens = 375e6 # these two numbers come from the GPT-3 paper, but may not be good defaults elsewhere
     final_tokens = 260e9 # (at what point we reach 10% of original LR)
     # checkpoint settings
-    ckpt_path = None
+    ckpt_path = "./Checkpoints/test.pt"
     num_workers = 0 # for DataLoader
 
     def __init__(self, **kwargs):
         for k,v in kwargs.items():
             setattr(self, k, v)
+
+    def camel_to_snake(str):
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', str).lower()
 
 class Trainer:
 
@@ -70,15 +78,30 @@ class Trainer:
             self.device = torch.cuda.current_device()
             self.model = torch.nn.DataParallel(self.model).to(self.device)
 
-        self.output = open('output.txt', 'a')
         self.writer = SummaryWriter(comment=comment)
         self.exp_reward = exp_reward
+        self.tag = comment
+
+        #format output folder
+        now = datetime.now()
+        dt_str = "./CSVruns/" + comment + "-" + now.strftime("%d-%m-%Y")
+        if not os.path.exists(dt_str):
+            os.makedirs(dt_str)
+        self.csv_path = dt_str
+        self.env_target_map = EnvTargetMap()
 
     def save_checkpoint(self):
         # DataParallel wrappers keep raw model object in .module attribute
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         logger.info("saving %s", self.config.ckpt_path)
-        # torch.save(raw_model.state_dict(), self.config.ckpt_path)
+        print(f"saving %s" % self.config.ckpt_path)
+        torch.save(raw_model.state_dict(), self.config.ckpt_path)
+
+    def load_checkpoint(self):
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        logger.info("loading %s", self.config.ckpt_path)
+        print(f"loading %s" % self.config.ckpt_path)
+        raw_model.load_state_dict(torch.load(self.config.ckpt_path))
 
     def train(self):
         model, config = self.model, self.config
@@ -149,8 +172,11 @@ class Trainer:
 
         self.tokens = 0 # counter used for learning rate decay
 
-        for epoch in range(config.max_epochs):
+        #load initial weights
+        if os.path.exists(self.config.ckpt_path):
+            self.load_checkpoint()
 
+        for epoch in range(config.max_epochs):
             run_epoch(self.writer, 'train', epoch_num=epoch)
             # if self.test_dataset is not None:
             #     test_loss = run_epoch('test')
@@ -159,28 +185,30 @@ class Trainer:
             # good_model = self.test_dataset is None or test_loss < best_loss
             # if self.config.ckpt_path is not None and good_model:
             #     best_loss = test_loss
-            #     self.save_checkpoint()
 
             # -- pass in target returns
             if self.config.model_type == 'naive':
                 eval_return = self.get_returns(0, epoch)
             elif self.config.model_type == 'reward_conditioned':
-                if self.config.game == 'Breakout':
-                    eval_return = self.get_returns(self.exp_reward, epoch)
-                elif self.config.game == 'Seaquest':
-                    eval_return = self.get_returns(1150, epoch)
-                elif self.config.game == 'Qbert':
-                    eval_return = self.get_returns(14000, epoch)
-                elif self.config.game == 'Pong':
-                    eval_return = self.get_returns(20, epoch)
-                else:
-                    raise NotImplementedError()
+                eval_return = self.get_returns(self.env_target_map[self.config.game], epoch)
             else:
                 raise NotImplementedError()
 
+            now = datetime.now()
+            path = self.tag + "-" + str(self.config.seed) +".csv"
+            path = os.path.join(self.csv_path, path)
+            isFirst = not os.path.exists(path)
+            with open(path, 'a', newline='') as csvfile:
+                output_writer = csv.writer(csvfile, delimiter=',')
+                if isFirst:
+                    output_writer.writerow(['Seed', 'Epoch', 'Score', 'Tag', 'Env'])
+                output_writer.writerow([self.config.seed, epoch, int(eval_return), self.tag, self.config.game])
+        #output the model
+        self.save_checkpoint()
+
     def get_returns(self, ret, epoch):
         self.model.train(False)
-        args=Args(self.config.game.lower(), self.config.seed)
+        args=Args(TrainerConfig.camel_to_snake(self.config.game), self.config.seed)
         env = Env(args)
         env.eval()
 
@@ -205,6 +233,7 @@ class Trainer:
                 action = sampled_action.cpu().numpy()[0,-1]
                 actions += [sampled_action]
                 state, reward, done = env.step(action)
+                env.render()
                 reward_sum += reward
                 j += 1
 
@@ -219,20 +248,21 @@ class Trainer:
                 rtgs += [rtgs[-1] - reward]
                 # all_states has all previous states and rtgs has all previous rtgs (will be cut to block_size in utils.sample)
                 # timestep is just current timestep
-                sampled_action = sample(self.model.module, all_states.unsqueeze(0), 1, temperature=1.0, sample=True, 
+                sampled_action = sample(self.model.module, all_states.unsqueeze(0), 1, temperature=1.0, sample=True,
                     actions=torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1).unsqueeze(0), 
                     rtgs=torch.tensor(rtgs, dtype=torch.long).to(self.device).unsqueeze(0).unsqueeze(-1), 
                     timesteps=(min(j, self.config.max_timestep) * torch.ones((1, 1, 1), dtype=torch.int64).to(self.device)))
         env.close()
         eval_return = sum(T_rewards)/10.
 
-        print("target retturn: %d, eval return: %d" % (ret, eval_return))
+        #log everything out
+        print("target return: %d, eval return: %d" % (ret, eval_return))
         for i in range(0, Episodes):
             self.writer.add_scalar("test_env_res", T_rewards[i], i + epoch*10)
 
         self.writer.add_scalar('mean_score_per_epoch', eval_return, epoch)
-
         self.model.train(True)
+
         return eval_return
 
 
