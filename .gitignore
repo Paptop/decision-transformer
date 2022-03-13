@@ -1,2 +1,7 @@
 atari/CSVruns/
 atari/runs/
+atari/dqn_replay
+atari/Checkpoints
+**/__pycache__/
+*.swp
+
